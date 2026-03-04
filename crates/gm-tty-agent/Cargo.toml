@@ -1,0 +1,19 @@
+[package]
+name = "gm-tty-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gm-tty-agent"
+path = "src/main.rs"
+
+[dependencies]
+gm-tty-protocol = { path = "../gm-tty-protocol" }
+tokio.workspace = true
+tokio-tungstenite = { workspace = true, features = ["native-tls"] }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+portable-pty.workspace = true
+futures-util.workspace = true

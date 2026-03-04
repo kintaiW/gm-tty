@@ -1,0 +1,10 @@
+/target
+Cargo.lock
+server.toml
+agent.toml
+certs/
+*.pem
+*.key
+.claude/
+docs/ARCHITECTURE.md
+CLAUDE.md

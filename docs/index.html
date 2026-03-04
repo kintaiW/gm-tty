@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>gm-tty — Web Terminal + Reverse Tunnel</title>
+  <meta name="description" content="轻量级 Web 终端 + 内网穿透工具。基于 WebSocket 协议，Rust 单二进制部署，无需 P2P 打洞。" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ── NAV ── -->
+<nav>
+  <div class="nav-inner">
+    <span class="nav-logo"><span class="accent">gm</span>-tty</span>
+    <div class="nav-links">
+      <a href="#how-it-works">原理</a>
+      <a href="#protocol">协议</a>
+      <a href="#quickstart">快速开始</a>
+      <a href="#roadmap">Roadmap</a>
+      <a class="btn-gh" href="https://github.com/GateMate-TQH/gm-tty" target="_blank" rel="noopener">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/></svg>
+        GitHub
+      </a>
+    </div>
+  </div>
+</nav>
+
+<!-- ── HERO ── -->
+<header class="hero">
+  <div class="container">
+    <div class="badge">Rust · WebSocket · Zero-Config</div>
+    <h1><span class="accent">gm-tty</span></h1>
+    <p class="tagline">Web 终端 + 内网穿透<br/>单二进制，无需 P2P，所有流量经自建 Server 中转</p>
+    <div class="hero-actions">
+      <a href="#quickstart" class="btn-primary">快速开始</a>
+      <a href="https://github.com/GateMate-TQH/gm-tty" target="_blank" rel="noopener" class="btn-secondary">查看源码</a>
+    </div>
+    <div class="terminal-demo">
+      <div class="terminal-bar">
+        <span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span>
+        <span class="terminal-title">gm-tty-server</span>
+      </div>
+      <pre class="terminal-body"><span class="dim">$</span> ./gm-tty-server
+<span class="warn">WARN</span>  temp token: <span class="accent-text">f7d1ba96…e7b4c</span>
+<span class="warn">WARN</span>  web url:    <span class="link">http://0.0.0.0:7093/terminal/f7d1ba96…</span>
+<span class="warn">WARN</span>  agent env:  GM_TTY_SERVER=ws://… GM_TTY_TOKEN=f7d1ba96…
+<span class="info">INFO</span>  server listening on http://0.0.0.0:7093
+<span class="info">INFO</span>  agent connected
+<span class="dim">_</span></pre>
+    </div>
+  </div>
+</header>
+
+<!-- ── FEATURES ── -->
+<section class="features">
+  <div class="container">
+    <div class="feature-grid">
+      <div class="feature-card">
+        <div class="feature-icon">⚡</div>
+        <h3>单二进制部署</h3>
+        <p>前端资源编译期内嵌到可执行文件，Server 仅 4.6 MB，Agent 仅 2.9 MB，无运行时依赖。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🔀</div>
+        <h3>反向隧道穿透</h3>
+        <p>Agent 主动连接公网 Server，无需公网 IP、端口映射或 P2P 打洞，防火墙友好。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🔒</div>
+        <h3>Token 会话隔离</h3>
+        <p>每个 Token 绑定独立会话，CSPRNG 生成 64 字符 hex，一时刻仅允许一个 Agent + 一个 Web 连接。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🔄</div>
+        <h3>指数退避重连</h3>
+        <p>Agent 网络中断后自动重连，初始 1s，最大 60s，响应 SIGINT/SIGTERM 优雅退出。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🖥️</div>
+        <h3>全功能终端</h3>
+        <p>基于 xterm.js，支持 256 色、窗口 Resize、滚动缓冲，原生 PTY 无缝透传。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🦀</div>
+        <h3>纯 Rust 实现</h3>
+        <p>tokio 异步运行时，零拷贝转发，内存安全，跨平台支持 Linux / macOS / Windows。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── HOW IT WORKS ── -->
+<section id="how-it-works" class="section section-alt">
+  <div class="container">
+    <h2 class="section-title">工作原理</h2>
+    <p class="section-sub">三个组件，两条 WebSocket 连接，一次数据转发</p>
+
+    <div class="arch-diagram">
+      <div class="arch-node browser">
+        <div class="arch-icon">🌐</div>
+        <div class="arch-label">浏览器</div>
+        <div class="arch-sub">xterm.js</div>
+      </div>
+      <div class="arch-arrow">
+        <div class="arrow-line"></div>
+        <div class="arrow-label">WSS<br/>/ws/web/{token}</div>
+      </div>
+      <div class="arch-node server">
+        <div class="arch-icon">☁️</div>
+        <div class="arch-label">Server</div>
+        <div class="arch-sub">公网 · axum</div>
+      </div>
+      <div class="arch-arrow">
+        <div class="arrow-line"></div>
+        <div class="arrow-label">WSS<br/>/ws/agent/{token}</div>
+      </div>
+      <div class="arch-node agent">
+        <div class="arch-icon">🖥️</div>
+        <div class="arch-label">Agent</div>
+        <div class="arch-sub">内网 · portable-pty</div>
+      </div>
+      <div class="arch-arrow">
+        <div class="arrow-line"></div>
+        <div class="arrow-label">PTY<br/>stdin/stdout</div>
+      </div>
+      <div class="arch-node shell">
+        <div class="arch-icon">💻</div>
+        <div class="arch-label">Shell</div>
+        <div class="arch-sub">bash / zsh / pwsh</div>
+      </div>
+    </div>
+
+    <div class="flow-steps">
+      <div class="flow-step">
+        <span class="step-num">1</span>
+        <div>
+          <strong>Agent 注册</strong>
+          <p>Agent 主动反向连接 Server 的 <code>/ws/agent/{token}</code>，Server 验证 Token 并创建待桥接会话。</p>
+        </div>
+      </div>
+      <div class="flow-step">
+        <span class="step-num">2</span>
+        <div>
+          <strong>用户访问</strong>
+          <p>浏览器加载内嵌前端页面，xterm.js 连接 <code>/ws/web/{token}</code>，Server 匹配 Token 完成桥接。</p>
+        </div>
+      </div>
+      <div class="flow-step">
+        <span class="step-num">3</span>
+        <div>
+          <strong>透明转发</strong>
+          <p>Server 以 <code>tokio::mpsc</code> channel 桥接两端，键盘输入 → PTY stdin，PTY stdout → 终端渲染，零解析开销。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── PROTOCOL ── -->
+<section id="protocol" class="section">
+  <div class="container">
+    <h2 class="section-title">通信协议</h2>
+    <p class="section-sub">Binary TLV 帧，5 字节固定头，避免 JSON 解析开销</p>
+
+    <div class="proto-layout">
+      <div class="proto-frame">
+        <div class="frame-field type">
+          <div class="field-label">Type</div>
+          <div class="field-size">1 B</div>
+        </div>
+        <div class="frame-field length">
+          <div class="field-label">Length</div>
+          <div class="field-size">4 B · BE</div>
+        </div>
+        <div class="frame-field payload">
+          <div class="field-label">Payload</div>
+          <div class="field-size">N B</div>
+        </div>
+      </div>
+
+      <table class="proto-table">
+        <thead>
+          <tr><th>Type</th><th>名称</th><th>方向</th><th>Payload</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>0x01</code></td><td>Data</td><td>双向</td><td>终端原始字节</td></tr>
+          <tr><td><code>0x02</code></td><td>Resize</td><td>Web → Agent</td><td><code>cols u16 BE + rows u16 BE</code></td></tr>
+          <tr><td><code>0x03</code></td><td>Heartbeat</td><td>双向</td><td>空</td></tr>
+          <tr><td><code>0x04</code></td><td>HeartbeatAck</td><td>双向</td><td>空</td></tr>
+          <tr><td><code>0x05</code></td><td>Close</td><td>双向</td><td>空</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ── QUICKSTART ── -->
+<section id="quickstart" class="section section-alt">
+  <div class="container">
+    <h2 class="section-title">快速开始</h2>
+    <p class="section-sub">三步完成内网 Shell 穿透</p>
+
+    <div class="steps">
+      <div class="step">
+        <div class="step-header">
+          <span class="step-badge">1</span>
+          <span>编译</span>
+        </div>
+        <pre class="code-block"><span class="dim"># 需要 Rust 1.75+</span>
+git clone https://github.com/GateMate-TQH/gm-tty
+cd gm-tty
+cargo build --release
+
+<span class="dim"># 产出</span>
+target/release/gm-tty-server   <span class="dim"># 4.6 MB，含前端</span>
+target/release/gm-tty-agent    <span class="dim"># 2.9 MB</span></pre>
+      </div>
+
+      <div class="step">
+        <div class="step-header">
+          <span class="step-badge">2</span>
+          <span>公网 Server 启动</span>
+        </div>
+        <pre class="code-block"><span class="dim"># 方式 A：自动生成临时 Token（开发测试）</span>
+./gm-tty-server
+
+<span class="dim"># 方式 B：配置文件</span>
+cat &gt; server.toml &lt;&lt;'EOF'
+listen_addr = "0.0.0.0:7093"
+tokens = ["your-secret-token"]
+EOF
+./gm-tty-server server.toml
+
+<span class="dim"># 生成随机 Token</span>
+./gm-tty-server gen-token</pre>
+      </div>
+
+      <div class="step">
+        <div class="step-header">
+          <span class="step-badge">3</span>
+          <span>内网 Agent 连接</span>
+        </div>
+        <pre class="code-block"><span class="dim"># 支持 ws:// (明文) 和 wss:// (TLS/反向代理)</span>
+GM_TTY_SERVER=wss://your-server.example.com \
+GM_TTY_TOKEN=your-secret-token \
+./gm-tty-agent
+
+<span class="dim"># 浏览器访问</span>
+https://your-server.example.com/terminal/your-secret-token</pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── ROADMAP ── -->
+<section id="roadmap" class="section">
+  <div class="container">
+    <h2 class="section-title">Roadmap</h2>
+    <div class="roadmap">
+      <div class="rm-phase done">
+        <div class="rm-badge">✓ Phase 1 · MVP</div>
+        <ul>
+          <li>Token 认证与会话隔离</li>
+          <li>WebSocket 双向中转</li>
+          <li>PTY 管理（bash / zsh / pwsh）</li>
+          <li>xterm.js Web 终端，窗口 Resize</li>
+          <li>指数退避断线重连</li>
+          <li>前端资源编译期内嵌</li>
+        </ul>
+      </div>
+      <div class="rm-phase active">
+        <div class="rm-badge">◎ Phase 2 · Production</div>
+        <ul>
+          <li>TLS 内置支持（rustls）</li>
+          <li>心跳超时自动清理</li>
+          <li>Token CLI 管理命令</li>
+          <li>会话审计日志</li>
+          <li>连接数与速率限制</li>
+        </ul>
+      </div>
+      <div class="rm-phase future">
+        <div class="rm-badge">○ Phase 3 · Advanced</div>
+        <ul>
+          <li>单连接多路复用</li>
+          <li>文件上传 / 下载</li>
+          <li>会话录制与回放（asciicast）</li>
+          <li>Web 管理面板</li>
+          <li>TLCP 国密 SSL 支持</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── FOOTER ── -->
+<footer>
+  <div class="container">
+    <p>
+      <strong class="accent">gm-tty</strong> · MIT License ·
+      <a href="https://github.com/GateMate-TQH/gm-tty" target="_blank" rel="noopener">GitHub</a>
+    </p>
+    <p class="footer-sub">Built with Rust · tokio · axum · xterm.js</p>
+  </div>
+</footer>
+
+</body>
+</html>
