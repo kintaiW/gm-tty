@@ -3,9 +3,11 @@ use std::{future::Future, time::Duration};
 use anyhow::Result;
 
 const INITIAL_DELAY: Duration = Duration::from_secs(1);
-const MAX_DELAY: Duration = Duration::from_secs(60);
+const MAX_DELAY: Duration = Duration::from_secs(30);
 
-/// 断线后指数退避重连，直到程序收到终止信号。
+/// 断线后重连：
+/// - 会话曾成功建立后断开 → 立即重连（delay 归零）
+/// - 握手/连接本身失败 → 指数退避（1s → 30s）
 pub async fn run_with_retry<F, Fut>(server_url: &str, token: &str, f: F)
 where
     F: Fn(String, String) -> Fut,
@@ -16,22 +18,34 @@ where
     loop {
         match f(server_url.to_owned(), token.to_owned()).await {
             Ok(()) => {
-                tracing::info!("session ended normally, reconnecting in {delay:?}");
+                // 会话正常结束（如被 Server 关闭）：立即重连，重置退避
+                delay = INITIAL_DELAY;
+                tracing::info!("session ended, reconnecting immediately");
             }
             Err(e) => {
-                tracing::warn!("session error: {e:#}, reconnecting in {delay:?}");
+                // 连接失败（握手/DNS/TLS）：退避后重试
+                tracing::warn!("connect error: {e:#}, retrying in {delay:?}");
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = shutdown_signal() => {
+                        tracing::info!("shutdown signal, exiting");
+                        return;
+                    }
+                }
+                delay = (delay * 2).min(MAX_DELAY);
+                continue;
             }
         }
 
+        // 正常断线：仅等待 shutdown 信号，否则立即重连
         tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
+            biased;
             _ = shutdown_signal() => {
                 tracing::info!("shutdown signal, exiting");
                 return;
             }
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
         }
-
-        delay = (delay * 2).min(MAX_DELAY);
     }
 }
 

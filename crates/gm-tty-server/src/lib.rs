@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use axum::{
@@ -15,7 +15,8 @@ use futures_util::{SinkExt, StreamExt};
 use gm_tty_protocol::{Frame, FrameType};
 use rand::RngCore;
 use rust_embed::Embed;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Notify, RwLock, mpsc};
+use tokio::time::{MissedTickBehavior, interval};
 use tower_http::trace::TraceLayer;
 use tracing::instrument;
 
@@ -29,14 +30,28 @@ pub use config::Config;
 #[folder = "../../frontend/"]
 struct FrontendAssets;
 
+// ── 常量 ────────────────────────────────────────────────────────
+
+/// Server 向 Agent/Web 发送 WS Ping 的间隔，防止反向代理空闲超时
+const PING_INTERVAL: Duration = Duration::from_secs(25);
+
+/// Agent 断线后 session 保留时长，给 Agent 重连的窗口
+const SESSION_RETAIN: Duration = Duration::from_secs(30);
+
+/// Web 等待 Agent 上线的最长时间
+const WAIT_AGENT_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ── 数据结构 ────────────────────────────────────────────────────
 
-/// Agent 注册后创建的半连接会话
 struct PendingSession {
-    /// Server 发给 Agent 的通道 (Web→Agent 方向)
+    /// Server 发给 Agent 的通道（Web→Agent 方向）
     to_agent: mpsc::Sender<Vec<u8>>,
-    /// Agent 发来数据的接收端 (Agent→Web 方向), 给 Web 连接时取走
+    /// Agent 发来数据的接收端（Agent→Web 方向），Web 连接时取走
     from_agent: Option<mpsc::Receiver<Vec<u8>>>,
+    /// Agent 是否当前在线
+    agent_online: bool,
+    /// Agent 重新上线时通知等待中的 Web
+    agent_notify: Arc<Notify>,
 }
 
 type Sessions = Arc<RwLock<HashMap<String, PendingSession>>>;
@@ -44,18 +59,17 @@ type Sessions = Arc<RwLock<HashMap<String, PendingSession>>>;
 #[derive(Clone)]
 struct AppState {
     sessions: Sessions,
-    /// 允许连接的 token 集合（MVP 阶段从配置加载）
     valid_tokens: Arc<Vec<String>>,
 }
 
-// ── 公共 Token 生成工具 ─────────────────────────────────────────
+// ── Token 生成 ───────────────────────────────────────────────────
 pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 
-// ── Server 入口 ─────────────────────────────────────────────────
+// ── Server 入口 ──────────────────────────────────────────────────
 pub async fn run(config: Config) -> Result<()> {
     let state = AppState {
         sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -78,13 +92,12 @@ pub async fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
-// ── 静态文件服务 ────────────────────────────────────────────────
+// ── 静态文件服务 ──────────────────────────────────────────���──────
 async fn serve_index() -> impl IntoResponse {
     serve_file("index.html")
 }
 
 async fn serve_terminal(Path(token): Path<String>) -> impl IntoResponse {
-    // 为 token 路径提供同一个 index.html，JS 从 URL 读取 token
     let _ = token;
     serve_file("index.html")
 }
@@ -111,7 +124,7 @@ fn serve_file(path: &str) -> impl IntoResponse {
     }
 }
 
-// ── Agent WebSocket 处理 ────────────────────────────────────────
+// ── Agent WebSocket 处理 ─────────────────────────────────────────
 #[instrument(skip_all, fields(token = %token))]
 async fn handle_agent_ws(
     ws: WebSocketUpgrade,
@@ -132,21 +145,38 @@ async fn agent_connected(socket: WebSocket, token: String, state: AppState) {
     let (to_agent_tx, mut to_agent_rx) = mpsc::channel::<Vec<u8>>(256);
     let (from_agent_tx, from_agent_rx) = mpsc::channel::<Vec<u8>>(256);
 
-    // 注册会话
-    {
+    // 注册或复用 session
+    let agent_notify = {
         let mut sessions = state.sessions.write().await;
-        sessions.insert(
-            token.clone(),
-            PendingSession {
-                to_agent: to_agent_tx,
-                from_agent: Some(from_agent_rx),
-            },
-        );
-    }
+        if let Some(s) = sessions.get_mut(&token) {
+            // Agent 重连：复用已有 notify，重建 channels，唤醒等待中的 Web
+            s.to_agent = to_agent_tx;
+            s.from_agent = Some(from_agent_rx);
+            s.agent_online = true;
+            let notify = s.agent_notify.clone();
+            notify.notify_waiters();
+            tracing::info!("agent reconnected, session resumed");
+            notify
+        } else {
+            // 全新 session
+            let notify = Arc::new(Notify::new());
+            sessions.insert(
+                token.clone(),
+                PendingSession {
+                    to_agent: to_agent_tx,
+                    from_agent: Some(from_agent_rx),
+                    agent_online: true,
+                    agent_notify: notify.clone(),
+                },
+            );
+            notify
+        }
+    };
+    let _ = agent_notify; // 保持 Arc 引用避免 notify 被提前释放
 
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Agent → Server (读取 Agent 输出，放入 from_agent channel)
+    // Agent → Server：读取 Agent 输出放入 from_agent channel
     let read_task = async {
         while let Some(Ok(msg)) = ws_rx.next().await {
             match msg {
@@ -156,16 +186,36 @@ async fn agent_connected(socket: WebSocket, token: String, state: AppState) {
                     }
                 }
                 Message::Close(_) => break,
+                Message::Ping(_) | Message::Pong(_) => {}
                 _ => {}
             }
         }
     };
 
-    // Server → Agent (从 to_agent channel 取数据写给 Agent)
+    // Server → Agent：从 to_agent channel 取数据写给 Agent，附带定时 Ping
     let write_task = async {
-        while let Some(data) = to_agent_rx.recv().await {
-            if ws_tx.send(Message::Binary(data.into())).await.is_err() {
-                break;
+        let mut ping_ticker = interval(PING_INTERVAL);
+        ping_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ping_ticker.tick().await; // 跳过第一个立即触发
+
+        loop {
+            tokio::select! {
+                data = to_agent_rx.recv() => {
+                    match data {
+                        Some(bytes) => {
+                            if ws_tx.send(Message::Binary(bytes.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = ping_ticker.tick() => {
+                    tracing::trace!("ping agent");
+                    if ws_tx.send(Message::Ping(vec![].into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     };
@@ -175,12 +225,33 @@ async fn agent_connected(socket: WebSocket, token: String, state: AppState) {
         _ = write_task => {},
     }
 
-    // 清理
-    state.sessions.write().await.remove(&token);
-    tracing::info!("agent disconnected");
+    // Agent 断线：标记离线，保留 session，启动清理定时器
+    {
+        let mut sessions = state.sessions.write().await;
+        if let Some(s) = sessions.get_mut(&token) {
+            s.agent_online = false;
+            // 取出 from_agent，防止 Web 继续从已关闭的 channel 读
+            s.from_agent = None;
+        }
+    }
+    tracing::info!("agent disconnected, retaining session for {}s", SESSION_RETAIN.as_secs());
+
+    // 超时后若 Agent 未重连则清理 session
+    let state_clone = state.clone();
+    let token_clone = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(SESSION_RETAIN).await;
+        let mut sessions = state_clone.sessions.write().await;
+        if let Some(s) = sessions.get(&token_clone) {
+            if !s.agent_online {
+                sessions.remove(&token_clone);
+                tracing::info!("session expired: token={token_clone}");
+            }
+        }
+    });
 }
 
-// ── Web WebSocket 处理 ──────────────────────────────────────────
+// ── Web WebSocket 处理 ───────────────────────────────────────────
 #[instrument(skip_all, fields(token = %token))]
 async fn handle_web_ws(
     ws: WebSocketUpgrade,
@@ -198,6 +269,33 @@ async fn handle_web_ws(
 async fn web_connected(mut socket: WebSocket, token: String, state: AppState) {
     tracing::info!("web connected");
 
+    // 若 Agent 离线，等待其重连（最多 WAIT_AGENT_TIMEOUT）
+    let agent_notify = {
+        let sessions = state.sessions.read().await;
+        match sessions.get(&token) {
+            Some(s) if !s.agent_online => Some(s.agent_notify.clone()),
+            None => {
+                // session 完全不存在（token 未使用或已过期）
+                tracing::warn!("no session for token");
+                let _ = socket.close().await;
+                return;
+            }
+            _ => None, // agent_online == true，直接继续
+        }
+    };
+
+    if let Some(notify) = agent_notify {
+        tracing::info!("agent offline, waiting up to {}s", WAIT_AGENT_TIMEOUT.as_secs());
+        match tokio::time::timeout(WAIT_AGENT_TIMEOUT, notify.notified()).await {
+            Ok(_) => tracing::info!("agent came online, proceeding"),
+            Err(_) => {
+                tracing::warn!("timed out waiting for agent");
+                let _ = socket.close().await;
+                return;
+            }
+        }
+    }
+
     // 取出 Agent 的数据通道
     let (to_agent, from_agent) = {
         let mut sessions = state.sessions.write().await;
@@ -208,7 +306,7 @@ async fn web_connected(mut socket: WebSocket, token: String, state: AppState) {
                 (tx, rx)
             }
             None => {
-                tracing::warn!("no agent for token, closing web ws");
+                tracing::warn!("session disappeared before web could connect");
                 let _ = socket.close().await;
                 return;
             }
@@ -236,11 +334,30 @@ async fn web_connected(mut socket: WebSocket, token: String, state: AppState) {
         }
     };
 
-    // out channel → WebSocket 发送
+    // out channel → WebSocket 发送，附带定时 Ping
     let out_to_ws = async move {
-        while let Some(data) = out_rx.recv().await {
-            if ws_tx.send(Message::Binary(data.into())).await.is_err() {
-                break;
+        let mut ping_ticker = interval(PING_INTERVAL);
+        ping_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ping_ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                data = out_rx.recv() => {
+                    match data {
+                        Some(bytes) => {
+                            if ws_tx.send(Message::Binary(bytes.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = ping_ticker.tick() => {
+                    tracing::trace!("ping web");
+                    if ws_tx.send(Message::Ping(vec![].into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     };
@@ -266,6 +383,7 @@ async fn web_connected(mut socket: WebSocket, token: String, state: AppState) {
                     }
                 }
                 Message::Close(_) => break,
+                Message::Ping(_) | Message::Pong(_) => {}
                 _ => {}
             }
         }

@@ -1,13 +1,18 @@
 use anyhow::Result;
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use gm_tty_protocol::{Frame, FrameType};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::mpsc;
+use tokio::time::{MissedTickBehavior, interval};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 mod reconnect;
+
+/// 每 25s 发一次 WS Ping，防止反向代理空闲超时（通常为 60s）
+const PING_INTERVAL: Duration = Duration::from_secs(25);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,7 +52,7 @@ async fn run_session(server_url: String, token: String) -> Result<()> {
 
     let cmd = CommandBuilder::new(&shell);
     let _child = pair.slave.spawn_command(cmd)?;
-    drop(pair.slave); // 关闭 slave 端，避免 PTY 读取挂起
+    drop(pair.slave);
 
     let mut pty_reader = pair.master.try_clone_reader()?;
     let mut pty_writer = pair.master.take_writer()?;
@@ -74,13 +79,33 @@ async fn run_session(server_url: String, token: String) -> Result<()> {
         tracing::info!("pty reader exited");
     });
 
-    // WebSocket 发送任务：从 channel 取 PTY 输出发给 Server
+    // WebSocket 发送任务：PTY 输出 + 定时 Ping 保活
     let send_task = async {
         let mut ws_tx = ws_tx;
         let mut pty_out_rx = pty_out_rx;
-        while let Some(data) = pty_out_rx.recv().await {
-            if ws_tx.send(Message::Binary(data.into())).await.is_err() {
-                break;
+        let mut ping_ticker = interval(PING_INTERVAL);
+        ping_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // 第一个 tick 立即触发，跳过它
+        ping_ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                data = pty_out_rx.recv() => {
+                    match data {
+                        Some(bytes) => {
+                            if ws_tx.send(Message::Binary(bytes.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = ping_ticker.tick() => {
+                    tracing::trace!("sending ws ping");
+                    if ws_tx.send(Message::Ping(vec![].into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     };
@@ -105,9 +130,8 @@ async fn run_session(server_url: String, token: String) -> Result<()> {
                     }
                 }
                 Message::Close(_) => break,
-                Message::Ping(data) => {
-                    // tungstenite 自动回 Pong，此处无需手动处理
-                    let _ = data;
+                Message::Ping(_) | Message::Pong(_) => {
+                    // tungstenite 自动处理 Ping/Pong
                 }
                 _ => {}
             }
@@ -149,10 +173,7 @@ fn handle_frame(
                 });
             }
         }
-        FrameType::Heartbeat => {
-            // Server 会处理心跳，Agent 侧只需忽略
-        }
-        FrameType::HeartbeatAck => {}
+        FrameType::Heartbeat | FrameType::HeartbeatAck => {}
         FrameType::Close => {
             tracing::info!("server requested close");
             return false;
