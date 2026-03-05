@@ -15,7 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use gm_tty_protocol::{Frame, FrameType};
 use rand::RngCore;
 use rust_embed::Embed;
-use tokio::sync::{Notify, RwLock, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tokio::time::{MissedTickBehavior, interval};
 use tower_http::trace::TraceLayer;
 use tracing::instrument;
@@ -32,10 +32,10 @@ struct FrontendAssets;
 
 // ── 常量 ────────────────────────────────────────────────────────
 
-/// Server 向 Agent/Web 发送 WS Ping 的间隔，防止反向代理空闲超时
+/// Server 向 Agent/Web 发送 WS Ping 的间隔
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 
-/// Agent 断线后 session 保留时长，给 Agent 重连的窗口
+/// Agent 断线后 session 保留时长
 const SESSION_RETAIN: Duration = Duration::from_secs(30);
 
 /// Web 等待 Agent 上线的最长时间
@@ -44,10 +44,12 @@ const WAIT_AGENT_TIMEOUT: Duration = Duration::from_secs(30);
 // ── 数据结构 ────────────────────────────────────────────────────
 
 struct PendingSession {
-    /// Server 发给 Agent 的通道（Web→Agent 方向）
+    /// Web → Agent 方向（clone-able sender）
     to_agent: mpsc::Sender<Vec<u8>>,
-    /// Agent 发来数据的接收端（Agent→Web 方向），Web 连接时取走
-    from_agent: Option<mpsc::Receiver<Vec<u8>>>,
+    /// Agent → Web 方向：可替换的 sender。
+    /// Agent 的 read task 每次发数据时从这里 clone sender 使用。
+    /// 新 Web 连接时替换此 sender（旧 sender 被 drop → 旧 Web 的 receiver 返回 None → 旧 Web 自动退出）。
+    web_tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
     /// Agent 是否当前在线
     agent_online: bool,
     /// Agent 重新上线时通知等待中的 Web
@@ -92,7 +94,7 @@ pub async fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
-// ── 静态文件服务 ──────────────────────────────────────────���──────
+// ── 静态文件服务 ─────────────────────────────────────────────────
 async fn serve_index() -> impl IntoResponse {
     serve_file("index.html")
 }
@@ -143,47 +145,49 @@ async fn agent_connected(socket: WebSocket, token: String, state: AppState) {
     tracing::info!("agent connected");
 
     let (to_agent_tx, mut to_agent_rx) = mpsc::channel::<Vec<u8>>(256);
-    let (from_agent_tx, from_agent_rx) = mpsc::channel::<Vec<u8>>(256);
 
     // 注册或复用 session
-    let agent_notify = {
+    let web_tx = {
         let mut sessions = state.sessions.write().await;
         if let Some(s) = sessions.get_mut(&token) {
-            // Agent 重连：复用已有 notify，重建 channels，唤醒等待中的 Web
+            // Agent 重连：复用已有 web_tx 和 notify，更新 to_agent
             s.to_agent = to_agent_tx;
-            s.from_agent = Some(from_agent_rx);
             s.agent_online = true;
             let notify = s.agent_notify.clone();
             notify.notify_waiters();
             tracing::info!("agent reconnected, session resumed");
-            notify
+            s.web_tx.clone()
         } else {
             // 全新 session
+            let web_tx = Arc::new(Mutex::new(None::<mpsc::Sender<Vec<u8>>>));
             let notify = Arc::new(Notify::new());
             sessions.insert(
                 token.clone(),
                 PendingSession {
                     to_agent: to_agent_tx,
-                    from_agent: Some(from_agent_rx),
+                    web_tx: web_tx.clone(),
                     agent_online: true,
-                    agent_notify: notify.clone(),
+                    agent_notify: notify,
                 },
             );
-            notify
+            web_tx
         }
     };
-    let _ = agent_notify; // 保持 Arc 引用避免 notify 被提前释放
 
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Agent → Server：读取 Agent 输出放入 from_agent channel
-    let read_task = async {
+    // Agent → Web：读取 Agent WS 输出，转发到当前 web_tx
+    let web_tx_read = web_tx.clone();
+    let read_task = async move {
         while let Some(Ok(msg)) = ws_rx.next().await {
             match msg {
                 Message::Binary(data) => {
-                    if from_agent_tx.send(data.to_vec()).await.is_err() {
-                        break;
+                    let tx = web_tx_read.lock().await.clone();
+                    if let Some(tx) = tx {
+                        // 如果 Web 端 channel 满了或断开了，忽略（不阻塞 Agent）
+                        let _ = tx.try_send(data.to_vec());
                     }
+                    // 无 Web 连接时数据丢弃（终端还没被查看）
                 }
                 Message::Close(_) => break,
                 Message::Ping(_) | Message::Pong(_) => {}
@@ -192,11 +196,11 @@ async fn agent_connected(socket: WebSocket, token: String, state: AppState) {
         }
     };
 
-    // Server → Agent：从 to_agent channel 取数据写给 Agent，附带定时 Ping
+    // Web → Agent：从 to_agent channel 取数据写给 Agent WS，附带定时 Ping
     let write_task = async {
         let mut ping_ticker = interval(PING_INTERVAL);
         ping_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        ping_ticker.tick().await; // 跳过第一个立即触发
+        ping_ticker.tick().await;
 
         loop {
             tokio::select! {
@@ -211,7 +215,6 @@ async fn agent_connected(socket: WebSocket, token: String, state: AppState) {
                     }
                 }
                 _ = ping_ticker.tick() => {
-                    tracing::trace!("ping agent");
                     if ws_tx.send(Message::Ping(vec![].into())).await.is_err() {
                         break;
                     }
@@ -225,18 +228,21 @@ async fn agent_connected(socket: WebSocket, token: String, state: AppState) {
         _ = write_task => {},
     }
 
-    // Agent 断线：标记离线，保留 session，启动清理定时器
+    // Agent 断线：标记离线，清理 web_tx，保留 session
     {
         let mut sessions = state.sessions.write().await;
         if let Some(s) = sessions.get_mut(&token) {
             s.agent_online = false;
-            // 取出 from_agent，防止 Web 继续从已关闭的 channel 读
-            s.from_agent = None;
+            // 清掉 web_tx，让当前 Web 的 receiver 自然返回 None → Web 退出
+            *s.web_tx.lock().await = None;
         }
     }
-    tracing::info!("agent disconnected, retaining session for {}s", SESSION_RETAIN.as_secs());
+    tracing::info!(
+        "agent disconnected, retaining session for {}s",
+        SESSION_RETAIN.as_secs()
+    );
 
-    // 超时后若 Agent 未重连则清理 session
+    // 超时清理
     let state_clone = state.clone();
     let token_clone = token.clone();
     tokio::spawn(async move {
@@ -269,23 +275,25 @@ async fn handle_web_ws(
 async fn web_connected(mut socket: WebSocket, token: String, state: AppState) {
     tracing::info!("web connected");
 
-    // 若 Agent 离线，等待其重连（最多 WAIT_AGENT_TIMEOUT）
+    // 若 Agent 离线，等待其重连
     let agent_notify = {
         let sessions = state.sessions.read().await;
         match sessions.get(&token) {
             Some(s) if !s.agent_online => Some(s.agent_notify.clone()),
             None => {
-                // session 完全不存在（token 未使用或已过期）
                 tracing::warn!("no session for token");
                 let _ = socket.close().await;
                 return;
             }
-            _ => None, // agent_online == true，直接继续
+            _ => None,
         }
     };
 
     if let Some(notify) = agent_notify {
-        tracing::info!("agent offline, waiting up to {}s", WAIT_AGENT_TIMEOUT.as_secs());
+        tracing::info!(
+            "agent offline, waiting up to {}s",
+            WAIT_AGENT_TIMEOUT.as_secs()
+        );
         match tokio::time::timeout(WAIT_AGENT_TIMEOUT, notify.notified()).await {
             Ok(_) => tracing::info!("agent came online, proceeding"),
             Err(_) => {
@@ -296,27 +304,27 @@ async fn web_connected(mut socket: WebSocket, token: String, state: AppState) {
         }
     }
 
-    // 取出 Agent 的数据通道
-    let (to_agent, from_agent) = {
-        let mut sessions = state.sessions.write().await;
-        match sessions.get_mut(&token) {
+    // 创建此 Web 客户端的专属 channel
+    let (new_web_tx, mut web_rx) = mpsc::channel::<Vec<u8>>(256);
+
+    // 获取 to_agent sender，并把新 web_tx 装入 session（踢掉旧 Web）
+    let to_agent = {
+        let sessions = state.sessions.read().await;
+        match sessions.get(&token) {
             Some(session) => {
                 let tx = session.to_agent.clone();
-                let rx = session.from_agent.take();
-                (tx, rx)
+                let web_tx_slot = session.web_tx.clone();
+                // 替换 web_tx：旧 sender 被 drop → 旧 Web 的 receiver 返回 None → 旧 Web 自动退出
+                *web_tx_slot.lock().await = Some(new_web_tx);
+                tracing::info!("web bridged (previous web kicked if any)");
+                tx
             }
             None => {
-                tracing::warn!("session disappeared before web could connect");
+                tracing::warn!("session disappeared");
                 let _ = socket.close().await;
                 return;
             }
         }
-    };
-
-    let Some(mut from_agent) = from_agent else {
-        tracing::warn!("from_agent already consumed (duplicate web connection)");
-        let _ = socket.close().await;
-        return;
     };
 
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -327,14 +335,14 @@ async fn web_connected(mut socket: WebSocket, token: String, state: AppState) {
 
     // Agent 输出 → out channel
     let agent_to_out = async move {
-        while let Some(data) = from_agent.recv().await {
+        while let Some(data) = web_rx.recv().await {
             if out_tx.send(data).await.is_err() {
                 break;
             }
         }
     };
 
-    // out channel → WebSocket 发送，附带定时 Ping
+    // out channel → WebSocket 发送 + 定时 Ping
     let out_to_ws = async move {
         let mut ping_ticker = interval(PING_INTERVAL);
         ping_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -353,7 +361,6 @@ async fn web_connected(mut socket: WebSocket, token: String, state: AppState) {
                     }
                 }
                 _ = ping_ticker.tick() => {
-                    tracing::trace!("ping web");
                     if ws_tx.send(Message::Ping(vec![].into())).await.is_err() {
                         break;
                     }
